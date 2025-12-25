@@ -1,0 +1,9 @@
+{
+  "version": "1.0.0",
+  "installed": 0,
+  "build": "dev",
+  "name": "Sports Ticker",
+  "changelog": "Initial release",
+  "download_url": "https://github.com/YOUR_USERNAME/sports-ticker/archive/refs/tags/v1.0.0.tar.gz",
+  "checksum": ""
+}

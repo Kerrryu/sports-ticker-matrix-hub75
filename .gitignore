@@ -1,0 +1,51 @@
+# Secrets and credentials
+secrets.py
+.env
+
+# Device-specific configuration
+config.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+
+# Logs
+logs/
+*.log
+
+# Temporary files
+/tmp/
+*.tmp
+
+# Backup files from OTA
+backups/
+
+# Test output
+.pytest_cache/
+.coverage
+htmlcov/
