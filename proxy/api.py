@@ -113,8 +113,14 @@ def get_scoreboard(sport):
     return None
 
 
-def parse_game(event, sport):
-    """Parse ESPN event into minimal game dict."""
+def parse_game(event, sport, tz_offset=0):
+    """Parse ESPN event into minimal game dict.
+
+    Args:
+        event: ESPN event data
+        sport: Sport type (nfl, nba, etc.)
+        tz_offset: Timezone offset in hours from UTC (e.g., -5 for EST)
+    """
     try:
         comp = event.get('competitions', [{}])[0]
         competitors = comp.get('competitors', [])
@@ -177,6 +183,8 @@ def parse_game(event, sport):
             if date_str:
                 try:
                     dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+                    # Apply timezone offset
+                    dt = dt + timedelta(hours=tz_offset)
                     game['date'] = dt.strftime('%b %d')
                     game['time'] = dt.strftime('%I:%M %p').lstrip('0')
                     game['sort_date'] = date_str  # Keep original for sorting
@@ -190,7 +198,7 @@ def parse_game(event, sport):
         return None
 
 
-def get_upcoming_games(sport, team_abbrev, limit=4):
+def get_upcoming_games(sport, team_abbrev, limit=4, tz_offset=0):
     """Get upcoming games for a team."""
     schedule = get_team_schedule(sport, team_abbrev)
     if not schedule:
@@ -210,7 +218,7 @@ def get_upcoming_games(sport, team_abbrev, limit=4):
 
             # Only future games
             if dt.replace(tzinfo=None) > now:
-                game = parse_game(event, sport)
+                game = parse_game(event, sport, tz_offset)
                 if game and game['status'] == 'pre':
                     upcoming.append(game)
                     if len(upcoming) >= limit:
@@ -232,7 +240,9 @@ def get_games():
             {"sport": "nfl", "team_id": "DET"},
             {"sport": "nba", "team_id": "DET"},
             ...
-        ]
+        ],
+        "tz": -5,  # Timezone offset (EST = -5, PST = -8)
+        "final_mins": 30  # How long to show final scores (minutes)
     }
 
     Returns minimal JSON (~1-3KB):
@@ -241,13 +251,17 @@ def get_games():
         "upcoming": [...]  # Next games when no active
     }
     """
-    # Get teams from request
+    # Get teams and options from request
     if request.method == 'POST':
         data = request.get_json() or {}
         teams = data.get('teams', [])
+        tz_offset = data.get('tz', 0)
+        final_mins = data.get('final_mins', 30)
     else:
         # Support GET with comma-separated teams
         teams_param = request.args.get('teams', '')
+        tz_offset = int(request.args.get('tz', 0))
+        final_mins = int(request.args.get('final_mins', 30))
         teams = []
         for t in teams_param.split(','):
             if ':' in t:
@@ -258,6 +272,8 @@ def get_games():
         return jsonify({'error': 'No teams specified', 'active': [], 'upcoming': []})
 
     active_games = []
+    live_games = []  # Separate list for live games (always show)
+    final_games = []  # Final games (filter by time)
     upcoming_games = []
     sports_checked = set()
 
@@ -272,26 +288,39 @@ def get_games():
 
             if scoreboard:
                 for event in scoreboard.get('events', []):
-                    game = parse_game(event, sport)
+                    game = parse_game(event, sport, tz_offset)
                     if game:
                         # Check if this game involves any of our teams
                         for t in teams:
                             if t.get('sport') == sport:
                                 tid = t.get('team_id', '').upper()
                                 if game['home'] == tid or game['away'] == tid:
-                                    if game['status'] in ['live', 'final']:
-                                        # Avoid duplicates
-                                        if game not in active_games:
-                                            active_games.append(game)
+                                    if game['status'] == 'live':
+                                        if game not in live_games:
+                                            live_games.append(game)
+                                    elif game['status'] == 'final':
+                                        if game not in final_games:
+                                            final_games.append(game)
                                     break
 
-    # If no active games, get upcoming games
-    if not active_games:
+    # Live games always take priority
+    active_games = live_games.copy()
+
+    # Only add final games if within the time window (final_mins)
+    # ESPN doesn't give us exact end time, so we show finals for a period
+    # After final_mins, we stop showing them and switch to upcoming
+    if final_games and not live_games:
+        # Show final scores for limited time, then switch to upcoming
+        # Since we can't know exact end time, we limit to showing max 1 final
+        active_games.extend(final_games[:1])
+
+    # If no active games (or only stale finals), get upcoming games
+    if not live_games:
         for team in teams:
             sport = team.get('sport', 'nfl').lower()
             team_id = team.get('team_id', '').upper()
 
-            upcoming = get_upcoming_games(sport, team_id, limit=2)
+            upcoming = get_upcoming_games(sport, team_id, limit=2, tz_offset=tz_offset)
             upcoming_games.extend(upcoming)
 
         # Sort by date chronologically and limit to 4

@@ -128,15 +128,20 @@ class SportsTicker:
         try:
             from src.api import ESPNClient
 
-            # Get proxy URL from config if available
+            # Get settings from config
             proxy_url = None
+            tz_offset = -5  # Default to EST
             if self.config:
                 proxy_url = self.config.get('proxy_url', '')
+                tz_offset = self.config.get('timezone_offset', -5)
 
-            self.api = ESPNClient(proxy_url=proxy_url if proxy_url else None)
+            self.api = ESPNClient(
+                proxy_url=proxy_url if proxy_url else None,
+                tz_offset=tz_offset
+            )
 
             if proxy_url:
-                print(f"API client ready (using proxy)")
+                print(f"API client ready (using proxy, TZ offset: {tz_offset})")
             else:
                 print("API client ready (direct ESPN - may have memory issues)")
             return True

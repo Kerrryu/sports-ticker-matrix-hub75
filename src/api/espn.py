@@ -102,16 +102,18 @@ TEAM_MAPS = {
 class ESPNClient:
     """Client for fetching sports data from ESPN API."""
 
-    def __init__(self, timeout=10, proxy_url=None):
+    def __init__(self, timeout=10, proxy_url=None, tz_offset=-5):
         """
         Initialize ESPN client.
 
         Args:
             timeout: Request timeout in seconds
             proxy_url: Optional proxy API URL for memory-constrained devices
+            tz_offset: Timezone offset from UTC (e.g., -5 for EST)
         """
         self.timeout = timeout
         self.proxy_url = proxy_url
+        self.tz_offset = tz_offset
         self.cache = {}
         self.cache_ttl = 60  # Cache for 60 seconds
 
@@ -215,12 +217,12 @@ class ESPNClient:
             print("No proxy URL configured")
             return {'active': [], 'upcoming': []}
 
-        # Build query string
+        # Build query string with timezone offset
         team_params = ','.join(
             f"{t.get('sport', 'nfl')}:{t.get('team_id', '')}"
             for t in teams
         )
-        url = f"{self.proxy_url}/api/games?teams={team_params}"
+        url = f"{self.proxy_url}/api/games?teams={team_params}&tz={self.tz_offset}"
 
         try:
             print(f"Fetching via proxy...")
