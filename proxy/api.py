@@ -12,13 +12,20 @@ Features:
 - Response size optimized for Pico 2W memory constraints
 """
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 import requests
 from datetime import datetime, timedelta
 import os
+import tarfile
+import io
+import hashlib
 
 app = Flask(__name__)
+
+# GitHub repo for OTA updates
+GITHUB_REPO = "Kerrryu/sports-ticker-matrix-hub75"
+GITHUB_RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_REPO}"
 CORS(app)
 
 # ESPN API endpoints
@@ -352,10 +359,197 @@ def index():
         'endpoints': {
             '/api/games': 'GET/POST - Fetch games for configured teams',
             '/api/health': 'GET - Health check',
+            '/api/ota/version': 'GET - Get latest version info from GitHub',
+            '/api/ota/manifest': 'GET - Get file manifest for a version',
+            '/api/ota/file': 'GET - Download a specific file from a release',
         },
-        'example': '/api/games?teams=nfl:DET,nba:DET,nhl:DET,mlb:DET'
+        'examples': {
+            'games': '/api/games?teams=nfl:DET,nba:DET&tz=-5',
+            'ota_version': '/api/ota/version',
+            'ota_manifest': '/api/ota/manifest?version=1.0.1',
+            'ota_file': '/api/ota/file?version=1.0.1&path=main.py',
+        }
     })
 
+
+# ============================================================================
+# OTA Update Endpoints
+# ============================================================================
+
+# Files to include in OTA updates (relative to repo root)
+OTA_FILES = [
+    'main.py',
+    'boot.py',
+    'version.json',
+    'src/__init__.py',
+    'src/api/__init__.py',
+    'src/api/espn.py',
+    'src/display/__init__.py',
+    'src/display/hub75.py',
+    'src/display/renderer.py',
+    'src/display/colors.py',
+    'src/display/fonts.py',
+    'src/display/simulator.py',
+    'src/ota/__init__.py',
+    'src/ota/updater.py',
+    'src/utils/__init__.py',
+    'src/utils/config.py',
+    'src/utils/network.py',
+    'src/web/__init__.py',
+    'src/web/server.py',
+    'src/web/routes.py',
+    'src/web/templates.py',
+]
+
+# Cache for extracted files (in-memory, cleared on cold start)
+_ota_cache = {}
+
+
+def _get_release_tarball(version):
+    """Download and cache release tarball from GitHub."""
+    cache_key = f"tarball_{version}"
+
+    if cache_key in _ota_cache:
+        return _ota_cache[cache_key]
+
+    # Download tarball
+    url = f"https://github.com/{GITHUB_REPO}/archive/refs/tags/v{version}.tar.gz"
+    print(f"OTA: Downloading tarball from {url}")
+
+    try:
+        response = requests.get(url, timeout=30)
+        if response.status_code != 200:
+            print(f"OTA: Failed to download tarball: HTTP {response.status_code}")
+            return None
+
+        # Extract tarball in memory
+        tar_data = io.BytesIO(response.content)
+        files = {}
+
+        with tarfile.open(fileobj=tar_data, mode='r:gz') as tar:
+            # Tarball extracts to {repo}-{version}/ directory
+            prefix = f"sports-ticker-matrix-hub75-{version}/"
+
+            for member in tar.getmembers():
+                if member.isfile():
+                    # Remove prefix from path
+                    rel_path = member.name
+                    if rel_path.startswith(prefix):
+                        rel_path = rel_path[len(prefix):]
+
+                    # Only include files we care about
+                    if rel_path in OTA_FILES:
+                        f = tar.extractfile(member)
+                        if f:
+                            files[rel_path] = f.read()
+                            print(f"OTA: Extracted {rel_path} ({len(files[rel_path])} bytes)")
+
+        _ota_cache[cache_key] = files
+        print(f"OTA: Cached {len(files)} files for v{version}")
+        return files
+
+    except Exception as e:
+        print(f"OTA: Error extracting tarball: {e}")
+        return None
+
+
+@app.route('/api/ota/manifest', methods=['GET'])
+def ota_manifest():
+    """
+    Get manifest of files for OTA update.
+
+    Query params:
+        version: Version to get manifest for (e.g., "1.0.1")
+
+    Returns:
+        JSON with file list, sizes, and checksums
+    """
+    version = request.args.get('version', '')
+    if not version:
+        return jsonify({'error': 'Version required'}), 400
+
+    files = _get_release_tarball(version)
+    if not files:
+        return jsonify({'error': f'Version {version} not found'}), 404
+
+    # Build manifest
+    manifest = {
+        'version': version,
+        'files': []
+    }
+
+    for path, content in files.items():
+        checksum = hashlib.sha256(content).hexdigest()[:16]  # Short checksum
+        manifest['files'].append({
+            'path': path,
+            'size': len(content),
+            'checksum': checksum
+        })
+
+    # Sort by path for consistent ordering
+    manifest['files'].sort(key=lambda f: f['path'])
+
+    return jsonify(manifest)
+
+
+@app.route('/api/ota/file', methods=['GET'])
+def ota_file():
+    """
+    Get a specific file from a release.
+
+    Query params:
+        version: Release version (e.g., "1.0.1")
+        path: File path (e.g., "src/api/espn.py")
+
+    Returns:
+        Raw file content
+    """
+    version = request.args.get('version', '')
+    path = request.args.get('path', '')
+
+    if not version or not path:
+        return jsonify({'error': 'Version and path required'}), 400
+
+    files = _get_release_tarball(version)
+    if not files:
+        return jsonify({'error': f'Version {version} not found'}), 404
+
+    if path not in files:
+        return jsonify({'error': f'File {path} not found in release'}), 404
+
+    content = files[path]
+
+    # Return raw content with appropriate headers
+    return Response(
+        content,
+        mimetype='application/octet-stream',
+        headers={
+            'Content-Length': len(content),
+            'X-Checksum': hashlib.sha256(content).hexdigest()[:16]
+        }
+    )
+
+
+@app.route('/api/ota/version', methods=['GET'])
+def ota_version():
+    """
+    Get latest version info from GitHub.
+    Proxies the version.json file.
+    """
+    branch = request.args.get('branch', 'main')
+    url = f"{GITHUB_RAW_BASE}/{branch}/version.json"
+
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            return jsonify(response.json())
+        else:
+            return jsonify({'error': f'HTTP {response.status_code}'}), response.status_code
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ============================================================================
 
 # For local development
 if __name__ == '__main__':

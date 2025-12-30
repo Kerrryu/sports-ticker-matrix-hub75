@@ -61,15 +61,17 @@ class OTAUpdater:
     BOOT_COUNT_FILE = '/boot_count.txt'
     MAX_BOOT_FAILURES = 3
 
-    def __init__(self, update_url, auto_check=True):
+    def __init__(self, update_url, auto_check=True, proxy_url=None):
         """
         Initialize OTA updater.
 
         Args:
-            update_url: URL to version.json file
+            update_url: URL to version.json file (or proxy /api/ota/version)
             auto_check: Automatically check for updates daily
+            proxy_url: Proxy URL for file-by-file downloads (e.g., https://espn-proxy.vercel.app)
         """
         self.update_url = update_url
+        self.proxy_url = proxy_url
         self.auto_check = auto_check
         self.current_version = self._load_current_version()
         self.latest_version = None
@@ -385,30 +387,115 @@ class OTAUpdater:
                         break
                     f_dst.write(chunk)
 
-    def install_update(self, update_path=None):
+    def install_update(self, update_path=None, progress_callback=None):
         """
-        Install downloaded update.
+        Install update by downloading files from proxy.
 
         Args:
-            update_path: Path to downloaded update file
+            update_path: Ignored (kept for API compatibility)
+            progress_callback: Function(current_file, total_files, filename)
 
         Returns:
             bool: True if installation successful
         """
+        if not self.proxy_url:
+            print("OTA: No proxy URL configured - cannot install")
+            return False
+
+        if not self.latest_version:
+            print("OTA: No version info - run check_for_update() first")
+            return False
+
         try:
-            print("OTA: Installing update...")
+            print(f"OTA: Installing v{self.latest_version} from proxy...")
 
-            # In a full implementation, we would:
-            # 1. Extract the tarball
-            # 2. Copy files over
-            # For now, just update version
+            # Step 1: Get manifest of files to download
+            manifest_url = f"{self.proxy_url}/api/ota/manifest?version={self.latest_version}"
+            print(f"OTA: Fetching manifest...")
 
-            # Update version file
+            response = urequests.get(manifest_url, timeout=30)
+            if response.status_code != 200:
+                print(f"OTA: Failed to get manifest: HTTP {response.status_code}")
+                response.close()
+                return False
+
+            manifest = response.json()
+            response.close()
+            gc.collect()
+
+            files = manifest.get('files', [])
+            if not files:
+                print("OTA: Empty manifest!")
+                return False
+
+            print(f"OTA: {len(files)} files to install")
+
+            # Step 2: Download and install each file
+            installed = 0
+            for i, file_info in enumerate(files):
+                path = file_info['path']
+                expected_size = file_info.get('size', 0)
+                expected_checksum = file_info.get('checksum', '')
+
+                if progress_callback:
+                    progress_callback(i + 1, len(files), path)
+
+                print(f"OTA: [{i+1}/{len(files)}] {path}")
+
+                # Download file
+                file_url = f"{self.proxy_url}/api/ota/file?version={self.latest_version}&path={path}"
+
+                for attempt in range(self.MAX_DOWNLOAD_RETRIES):
+                    try:
+                        response = urequests.get(file_url, timeout=30)
+
+                        if response.status_code != 200:
+                            print(f"OTA: Download failed: HTTP {response.status_code}")
+                            response.close()
+                            continue
+
+                        content = response.content
+                        response.close()
+
+                        # Verify size
+                        if expected_size and len(content) != expected_size:
+                            print(f"OTA: Size mismatch: {len(content)} vs {expected_size}")
+                            continue
+
+                        # Verify checksum if available
+                        if expected_checksum and HASH_AVAILABLE:
+                            actual = hashlib.sha256(content).hexdigest()[:16]
+                            if actual != expected_checksum:
+                                print(f"OTA: Checksum mismatch!")
+                                continue
+
+                        # Ensure directory exists
+                        self._ensure_dir('/' + path)
+
+                        # Write file
+                        with open('/' + path, 'wb') as f:
+                            f.write(content)
+
+                        installed += 1
+                        gc.collect()
+                        break
+
+                    except Exception as e:
+                        print(f"OTA: Error downloading {path}: {e}")
+                        gc.collect()
+                        time.sleep(1)
+
+            print(f"OTA: Installed {installed}/{len(files)} files")
+
+            if installed < len(files):
+                print("OTA: Some files failed to install!")
+                self._log_update('partial', f"{installed}/{len(files)} files")
+                return False
+
+            # Step 3: Update version file
             self._save_version(self.latest_version)
 
-            print(f"OTA: Update installed: v{self.latest_version}")
-
-            # Log update
+            print(f"OTA: Update to v{self.latest_version} complete!")
             self._log_update('success')
 
             return True
@@ -417,6 +504,34 @@ class OTAUpdater:
             print(f"OTA: Installation error: {e}")
             self._log_update('failed', str(e))
             return False
+        finally:
+            gc.collect()
+
+    def _ensure_dir(self, filepath):
+        """Ensure directory exists for a file path."""
+        if not OS_AVAILABLE:
+            return
+
+        import os
+
+        # Get directory path
+        parts = filepath.split('/')
+        if len(parts) <= 2:
+            return  # Root level file, no dir needed
+
+        # Build directory path
+        dir_path = '/'.join(parts[:-1])
+
+        # Create directories recursively
+        current = ''
+        for part in parts[:-1]:
+            if not part:
+                continue
+            current += '/' + part
+            try:
+                os.mkdir(current)
+            except OSError:
+                pass  # Directory exists
 
     def _log_update(self, status, error=None):
         """Log update attempt."""
@@ -524,9 +639,14 @@ class OTAUpdater:
         else:
             print("OTA: machine.reset() not available (running on PC)")
 
-    def full_update_flow(self):
+    def full_update_flow(self, progress_callback=None):
         """
-        Complete update flow: check, download, backup, install, restart.
+        Complete update flow: check, backup, install, restart.
+
+        Uses proxy for file-by-file download (no tarball needed).
+
+        Args:
+            progress_callback: Function(current_file, total_files, filename)
 
         Returns:
             bool: True if update completed successfully
@@ -536,20 +656,15 @@ class OTAUpdater:
             if not self.check_for_update():
                 return False
 
-            # 2. Download update
-            update_path = self.download_update()
-            if not update_path:
-                return False
-
-            # 3. Backup current version
+            # 2. Backup current version
             if not self.backup_current_version():
                 print("OTA: Warning: Backup failed, continuing anyway...")
 
-            # 4. Install update
-            if not self.install_update(update_path):
+            # 3. Install update (downloads files from proxy)
+            if not self.install_update(progress_callback=progress_callback):
                 return False
 
-            # 5. Restart device
+            # 4. Restart device
             self.restart_device()
 
             return True

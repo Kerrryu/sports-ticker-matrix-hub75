@@ -169,9 +169,18 @@ class SportsTicker:
         try:
             from src.ota import OTAUpdater
             update_url = self.config.get('update_url', '') if self.config else ''
+            proxy_url = self.config.get('proxy_url', '') if self.config else ''
+
             if update_url:
-                self.ota = OTAUpdater(update_url, auto_check=True)
-                print("OTA updater ready")
+                self.ota = OTAUpdater(
+                    update_url,
+                    auto_check=True,
+                    proxy_url=proxy_url if proxy_url else None
+                )
+                if proxy_url:
+                    print("OTA updater ready (using proxy for file downloads)")
+                else:
+                    print("OTA updater ready (no proxy - limited functionality)")
             else:
                 print("No update URL configured, OTA disabled")
             return True
